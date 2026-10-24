@@ -1,0 +1,662 @@
+# -*- coding: utf-8 -*-
+"""
+MOSFET_Between_Pads_Dimensioned.FCMacro
+
+Same layout as MOSFET_Between_Pads.FCMacro (14 pads, 70 x 70 um, 140 um pitch,
+5 NMOS DUTs placed in the 70 um gaps between each D_force / D_sense pad pair,
+Kelvin drain + source, shared G/B/S buses) PLUS:
+
+  1. A dimensioned top view (pad size, pitch, gap, device positions, total
+     footprint) and an 8:1 DETAIL A of the M1 gap (routing widths, spacings,
+     device structure). Dimension values are TRUE um, not drawing units.
+  2. A design-rule table with calculated margins (FreeCAD drawing + Spreadsheet
+     + Report view).
+  3. A concept-vs-foundry comparison table and an on-drawing banner.
+
+=============================  READ THIS FIRST  ==============================
+This is a CONCEPTUAL FreeCAD VISUALIZATION, not a foundry-rule-compliant
+physical layout.
+
+  * The rule values in RULES are generic PLACEHOLDERS, not from any PDK.
+    "OK" against them does NOT mean DRC/LVS clean at a foundry.
+  * No wells/implants/STI/guard rings, no passivation opening, no GDS layer
+    numbers, no manufacturing grid, single oversized contacts/vias instead of
+    exact-size arrays. The table marks these as NON-COMPLIANT on purpose.
+  * The real layout must be drawn/verified in the foundry PDK flow
+    (KLayout / Virtuoso etc.: DRC, LVS, parasitic extraction, EM/IR).
+==============================================================================
+
+Units: all coordinates are um; converted to FreeCAD mm (1 um = 0.001 mm).
+Run: Macro > Macros... > select file > Execute. Zoom in (View > Fit all) -
+text is um-scale.
+"""
+
+import math
+import os
+import FreeCAD as App
+import Part
+from FreeCAD import Vector
+
+UM = 0.001
+
+# ------------------------------ given (problem) ----------------------------
+PAD_GIVEN = 70.0
+PITCH_GIVEN = 140.0
+PAD = PAD_GIVEN
+PITCH = PITCH_GIVEN
+N_PADS = 14
+N_DUT = 5
+
+# ------------------------------ design parameters (um) ---------------------
+W_ACT = 20.0       # MOSFET width  W
+L_GATE = 2.0       # MOSFET length L
+W_FORCE = 6.0      # force trace width
+W_SENSE = 2.0      # sense trace width
+W_STUB = 4.0       # gate / bulk / source-force stub width
+VIA_S = 4.0        # drawn via size (concept: single big via)
+LAND_S = 6.0       # metal landing size around a via
+LABEL_SIZE = 7.0   # pad label text height (um)
+
+Y_BUS = {"G": -60.0, "B": -80.0, "SF": -100.0, "SS": -120.0}
+BUS_W = {"G": W_FORCE, "B": W_FORCE, "SF": W_FORCE, "SS": W_SENSE}
+
+Y_SRC = (-14.0, 6.0)
+Y_GATE = (6.0, 6.0 + L_GATE)
+Y_DRN = (Y_GATE[1], Y_GATE[1] + 20.0)
+Y_SRC_C = -4.0
+Y_GATE_C = Y_GATE[0] + L_GATE / 2
+Y_DRN_C = Y_DRN[0] + 10.0
+
+X_STUB = {"B": -28.0, "G": -18.0, "SF": -4.0, "SS": 4.0}
+W_NET = {"B": W_STUB, "G": W_STUB, "SF": W_STUB, "SS": W_SENSE}
+
+# -------- PLACEHOLDER rule set + test conditions (NOT from any foundry) ----
+RULES = dict(
+    M1_W=0.5, M1_S=0.5, M2_W=0.6, M2_S=0.6,
+    POLY_W=0.18, ENDCAP=0.25, DIFF_W=0.3, DIFF_S=0.4, POLY_CON_S=0.15,
+    CON_SIZE=0.25, VIA_SIZE=0.5, MET_ENCL_VIA=0.2, MAX_WIDE_METAL=12.0,
+    PAD_MIN_SIZE=50.0, PAD_MIN_PITCH=100.0, PAD_MIN_SPACE=25.0,
+    ACTIVE_TO_PAD=10.0,
+    J_M1=1.0, J_M2=2.0,        # mA per um of width (assumed EM limits)
+    RS_M1=0.09, RS_M2=0.08,    # ohm/square (assumed)
+)
+I_TEST_MA = 5.0               # assumed max DUT current during the test
+
+# -------------------------------- appearance --------------------------------
+DIM_Z = 3.0
+DIM_TEXT = 12.0     # text height of the overall-view dimensions (um)
+DET_TEXT = 9.0      # text height inside DETAIL A (um)
+TABLE_TEXT = 10.0   # table text height (um)
+EXPORT_CSV = False  # True: write every rectangle to ~/mosfet_test_module_rects.csv
+
+Z = {
+    "SUB": (-1.0, 0.0), "DIFF": (0.0, 0.2), "POLY": (0.2, 0.4),
+    "M1": (1.0, 1.5), "VIA": (1.5, 2.0), "M2": (2.0, 2.5),
+    "CON": (0.2, 2.0),
+}
+COLORS = {
+    "SUB": (0.80, 0.80, 0.80), "DIFF": (0.20, 0.70, 0.20),
+    "POLY": (0.85, 0.20, 0.20), "M1": (0.20, 0.40, 0.90),
+    "VIA": (0.10, 0.10, 0.10), "M2": (0.95, 0.75, 0.10),
+    "PADS": (1.00, 0.85, 0.20), "CON": (0.10, 0.10, 0.10),
+    "DIM": (0.85, 0.05, 0.05), "TABLE": (0.0, 0.0, 0.0),
+}
+
+# -------------------------------- document ---------------------------------
+doc = App.newDocument("MOSFET_Between_Pads_Dimensioned")
+groups = {n: doc.addObject("App::DocumentObjectGroup", "L_" + n) for n in COLORS}
+rects_all = []   # every solid rectangle (um) - used for DRC, bbox, detail, export
+
+
+# ----------------------------- geometry helpers ----------------------------
+def _solid(layer, label, x0, y0, x1, y1, z0, z1):
+    obj = doc.addObject("Part::Feature", label)
+    obj.Shape = Part.makeBox((x1 - x0) * UM, (y1 - y0) * UM, (z1 - z0) * UM,
+                             Vector(x0 * UM, y0 * UM, z0 * UM))
+    obj.Label = label
+    groups[layer].addObject(obj)
+    if App.GuiUp:
+        obj.ViewObject.ShapeColor = COLORS[layer]
+    return obj
+
+
+def box(layer, label, x0, y0, x1, y1, net=None, zkey=None, z=None, kind="geom"):
+    xa, xb = sorted((x0, x1))
+    ya, yb = sorted((y0, y1))
+    z0, z1 = z if z else Z[zkey or layer]
+    obj = _solid(layer, label, xa, ya, xb, yb, z0, z1)
+    rects_all.append(dict(layer=layer, label=label, net=net, kind=kind,
+                          x0=xa, y0=ya, x1=xb, y1=yb, z0=z0, z1=z1))
+    return obj
+
+
+def vline(layer, label, x, y0, y1, w, net):
+    return box(layer, label, x - w / 2, y0, x + w / 2, y1, net)
+
+
+def hline(layer, label, y, x0, x1, w, net):
+    return box(layer, label, x0, y - w / 2, x1, y + w / 2, net)
+
+
+def sq(layer, label, x, y, s, net=None, z=None):
+    return box(layer, label, x - s / 2, y - s / 2, x + s / 2, y + s / 2, net, z=z)
+
+
+def contact(label, x, y, s, start_layer):
+    sq("CON", label, x, y, s, z=(Z[start_layer][1], Z["CON"][1]))
+
+
+def bus_via(net, x, y, tag):
+    sq("M1", "M1LAND_" + tag, x, y, LAND_S, net)
+    sq("VIA", "VIA_" + tag, x, y, VIA_S)
+    sq("M2", "M2LAND_" + tag, x, y, LAND_S, net)
+
+
+def dl(r):
+    return "M2" if r["layer"] in ("M2", "PADS") else r["layer"]
+
+
+def rect_dist(a, b):
+    dx = max(a["x0"] - b["x1"], b["x0"] - a["x1"], 0.0)
+    dy = max(a["y0"] - b["y1"], b["y0"] - a["y1"], 0.0)
+    return math.hypot(dx, dy)
+
+
+def by_label(label):
+    for r in rects_all:
+        if r["label"] == label:
+            return r
+    raise KeyError(label)
+
+
+# ---------------------------- annotation helpers ---------------------------
+def add_label(text, x_um, y_um, size_um, just="Center", color=(0.0, 0.0, 0.0)):
+    """Draft text of height size_um (um) anchored at (x, y) in um."""
+    import Draft
+    make = getattr(Draft, "make_text", None) or getattr(Draft, "makeText")
+    t = make([text], Vector(x_um * UM, y_um * UM, DIM_Z * UM))
+    if App.GuiUp:
+        vo = t.ViewObject
+        vo.FontSize = size_um * UM
+        for prop, val in (("Justification", just), ("TextColor", color)):
+            try:
+                setattr(vo, prop, val)
+            except Exception:
+                pass
+    return t
+
+
+def seg(x0, y0, x1, y1):
+    return Part.makeLine(Vector(x0 * UM, y0 * UM, DIM_Z * UM),
+                         Vector(x1 * UM, y1 * UM, DIM_Z * UM))
+
+
+def rect_edges(x0, y0, x1, y1):
+    return [seg(x0, y0, x1, y0), seg(x1, y0, x1, y1),
+            seg(x1, y1, x0, y1), seg(x0, y1, x0, y0)]
+
+
+def edges_obj(label, edges, group="DIM", color=None, width=1.0):
+    obj = doc.addObject("Part::Feature", label)
+    obj.Shape = Part.makeCompound(edges)
+    obj.Label = label
+    groups[group].addObject(obj)
+    if App.GuiUp:
+        obj.ViewObject.LineColor = color or COLORS[group]
+        obj.ViewObject.LineWidth = width
+    return obj
+
+
+def _pick(v, i):
+    return v[i] if isinstance(v, (list, tuple)) else v
+
+
+def hchain(label, xs, y, labels, size, ext_from=None, ext_over=3.0, alt=False):
+    """Horizontal dimension chain. Positions in drawing um, labels are text."""
+    t = size * 0.35
+    edges = [seg(xs[0], y, xs[-1], y)]
+    for i, x in enumerate(xs):
+        edges.append(seg(x - t, y - t, x + t, y + t))
+        ef = _pick(ext_from, i)
+        if ef is not None:
+            edges.append(seg(x, ef, x, y + ext_over if ef < y else y - ext_over))
+    edges_obj(label, edges)
+    for i, txt in enumerate(labels):
+        ty = y - size * 1.6 if (alt and i % 2 == 1) else y + size * 0.5
+        add_label(txt, (xs[i] + xs[i + 1]) / 2, ty, size, color=(0.7, 0, 0))
+
+
+def vchain(label, ys, x, labels, size, ext_from=None, ext_over=3.0, side=1):
+    """Vertical dimension chain; text on the +x side (side=1) or -x side (-1)."""
+    t = size * 0.35
+    edges = [seg(x, ys[0], x, ys[-1])]
+    for i, y in enumerate(ys):
+        edges.append(seg(x - t, y - t, x + t, y + t))
+        ef = _pick(ext_from, i)
+        if ef is not None:
+            edges.append(seg(ef, y, x + ext_over if ef < x else x - ext_over, y))
+    edges_obj(label, edges)
+    for i, txt in enumerate(labels):
+        add_label(txt, x + side * size * 0.7, (ys[i] + ys[i + 1]) / 2 - size / 2,
+                  size, just="Left" if side > 0 else "Right", color=(0.7, 0, 0))
+
+
+def draw_table(title, rows, x0, y_top, size):
+    """Draw a grid table with one text per cell. Returns the bottom y."""
+    pad = size * 0.5
+    ncol = len(rows[0])
+    widths = [max(len(str(r[c])) for r in rows) * size * 0.62 + 2 * pad
+              for c in range(ncol)]
+    rh = size * 1.9
+    width, height = sum(widths), rh * len(rows)
+    edges = [seg(x0, y_top - i * rh, x0 + width, y_top - i * rh)
+             for i in range(len(rows) + 1)]
+    xc = x0
+    for c in range(ncol + 1):
+        edges.append(seg(xc, y_top, xc, y_top - height))
+        if c < ncol:
+            xc += widths[c]
+    edges_obj("TABLE_" + title.split()[0], edges, "TABLE", width=1.0)
+    add_label(title, x0, y_top + size * 0.8, size * 1.25, just="Left")
+    for r, row in enumerate(rows):
+        xc = x0
+        for c, cell in enumerate(row):
+            add_label(str(cell), xc + pad, y_top - (r + 1) * rh + (rh - size) / 2,
+                      size, just="Left")
+            xc += widths[c]
+    return y_top - height
+
+
+def to_sheet(name, rows):
+    try:
+        sh = doc.addObject("Spreadsheet::Sheet", name)
+        for r, row in enumerate(rows):
+            for c, cell in enumerate(row):
+                sh.set("%s%d" % (chr(65 + c), r + 1), "'" + str(cell))
+        return sh
+    except Exception as e:
+        App.Console.PrintWarning("Spreadsheet %s skipped: %s\n" % (name, e))
+
+
+def print_table(title, rows):
+    widths = [max(len(str(r[c])) for r in rows) for c in range(len(rows[0]))]
+    App.Console.PrintMessage("\n== %s ==\n" % title)
+    for i, row in enumerate(rows):
+        App.Console.PrintMessage(
+            " | ".join(str(c).ljust(widths[k]) for k, c in enumerate(row)) + "\n")
+        if i == 0:
+            App.Console.PrintMessage("-+-".join("-" * w for w in widths) + "\n")
+
+
+def fmt(v):
+    return "%g" % round(v, 3)
+
+
+# =============================== GEOMETRY ====================================
+labels = ["G", "B", "SF", "SS"]
+for k in range(1, N_DUT + 1):
+    labels += ["M%d_DF" % k, "M%d_DS" % k]
+assert len(labels) == N_PADS
+pad_x = [i * PITCH for i in range(N_PADS)]
+
+
+def pad_net(lab):
+    return lab.split("_")[0] + "_D" if lab.startswith("M") else lab
+
+
+box("SUB", "SUBSTRATE_B", pad_x[0] - 100, Y_BUS["SS"] - 40,
+    pad_x[-1] + 100, PAD / 2 + 45, zkey="SUB", kind="sub")
+
+for i, lab in enumerate(labels):
+    box("PADS", "PAD%02d_%s" % (i + 1, lab), pad_x[i] - PAD / 2, -PAD / 2,
+        pad_x[i] + PAD / 2, PAD / 2, net=pad_net(lab), zkey="M2", kind="pad")
+
+dev_cx = [pad_x[4 + 2 * k] + PITCH / 2 for k in range(N_DUT)]
+
+for net, idx in (("G", 0), ("B", 1), ("SF", 2), ("SS", 3)):
+    xp, yb = pad_x[idx], Y_BUS[net]
+    w = BUS_W[net]
+    vline("M2", "DROP_" + net, xp, yb, 0.0, w, net)
+    bus_via(net, xp, yb, "PAD_" + net)
+    x_end = max(cx + X_STUB[net] for cx in dev_cx)
+    hline("M1", "BUS_" + net, yb, xp - 3.0, x_end + 3.0, w, net)
+
+for k, cx in enumerate(dev_cx, start=1):
+    t = "M%d" % k
+    dnet = t + "_D"
+    x_left_pad_edge = cx - PITCH / 2 + PAD / 2
+    x_right_pad_edge = cx + PITCH / 2 - PAD / 2
+
+    box("DIFF", t + "_ACTIVE", cx - W_ACT / 2, Y_SRC[0], cx + W_ACT / 2, Y_DRN[1])
+    box("DIFF", t + "_BULK_TAP", cx - 31.0, Y_SRC[0], cx - 25.0, Y_SRC[1])
+    box("POLY", t + "_GATE_POLY", cx - 21.0, Y_GATE[0], cx + W_ACT / 2 + 2.0,
+        Y_GATE[1])
+
+    xg = cx + X_STUB["G"]
+    vline("M2", t + "_G_STUB", xg, Y_GATE_C, Y_BUS["G"], W_NET["G"], "G")
+    bus_via("G", xg, Y_BUS["G"], t + "_G")
+    contact(t + "_G_CON", xg, Y_GATE_C, 4.0, "POLY")
+
+    xb = cx + X_STUB["B"]
+    vline("M2", t + "_B_STUB", xb, Y_SRC_C, Y_BUS["B"], W_NET["B"], "B")
+    bus_via("B", xb, Y_BUS["B"], t + "_B")
+    contact(t + "_B_CON", xb, Y_SRC_C, 4.0, "DIFF")
+
+    for net, lab in (("SF", "S_FORCE"), ("SS", "S_SENSE")):
+        xs = cx + X_STUB[net]
+        vline("M2", "%s_%s_STUB" % (t, lab), xs, Y_SRC_C, Y_BUS[net],
+              W_NET[net], net)
+        bus_via(net, xs, Y_BUS[net], "%s_%s" % (t, lab))
+        contact("%s_%s_CON" % (t, lab), xs, Y_SRC_C, 4.0, "DIFF")
+
+    hline("M2", t + "_DF_TRACE", Y_DRN_C, x_left_pad_edge - 3.0, cx + W_FORCE / 2,
+          W_FORCE, dnet)
+    hline("M2", t + "_DS_TRACE", Y_DRN_C, cx - W_SENSE / 2, x_right_pad_edge + 3.0,
+          W_SENSE, dnet)
+    contact(t + "_D_CON", cx, Y_DRN_C, 6.0, "DIFF")
+
+# ============================ derived measurements ===========================
+metal = [r for r in rects_all if r["layer"] != "SUB"]
+bx0 = min(r["x0"] for r in metal)
+bx1 = max(r["x1"] for r in metal)
+by0 = min(r["y0"] for r in metal)
+by1 = max(r["y1"] for r in metal)
+BW, BH = bx1 - bx0, by1 - by0
+
+
+def min_dim(layers, skip_pads=True):
+    return min(min(r["x1"] - r["x0"], r["y1"] - r["y0"]) for r in rects_all
+               if r["layer"] in layers and not (skip_pads and r["kind"] == "pad"))
+
+
+def max_trace_w(layers):
+    return max(min(r["x1"] - r["x0"], r["y1"] - r["y0"]) for r in rects_all
+               if r["layer"] in layers and r["kind"] != "pad")
+
+
+def min_spacing(layer, pad_pairs_only=False):
+    items = [r for r in rects_all if r["net"] is not None and dl(r) == layer]
+    best, ba, bb, nviol = 1e9, None, None, 0
+    lim = RULES["M1_S"] if layer == "M1" else RULES["M2_S"]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            if a["net"] == b["net"]:
+                continue
+            if pad_pairs_only and ((a["kind"] == "pad") == (b["kind"] == "pad")):
+                continue
+            d = rect_dist(a, b)
+            if d < lim:
+                nviol += 1
+                App.Console.PrintWarning("SPACING/SHORT %s: %s vs %s = %.2f um\n"
+                                         % (layer, a["label"], b["label"], d))
+            if d < best:
+                best, ba, bb = d, a, b
+    return best, ba, bb, nviol
+
+
+m1_sp = min_spacing("M1")
+m2_sp = min_spacing("M2")
+pad_clear = min_spacing("M2", pad_pairs_only=True)
+n_geom_viol = m1_sp[3] + m2_sp[3]
+
+g1 = by_label("M1_ACTIVE")
+tap1 = by_label("M1_BULK_TAP")
+poly1 = by_label("M1_GATE_POLY")
+endcap = poly1["x1"] - g1["x1"]
+tap_sp = rect_dist(tap1, g1)
+poly_con = min(rect_dist(poly1, by_label(n)) for n in
+               ("M1_S_FORCE_CON", "M1_S_SENSE_CON", "M1_D_CON"))
+act_pad = min(rect_dist(g1, by_label("PAD05_M1_DF")),
+              rect_dist(g1, by_label("PAD06_M1_DS")))
+band_bot = g1["y0"] - (-PAD / 2)
+band_top = PAD / 2 - g1["y1"]
+con_min = min(r["x1"] - r["x0"] for r in rects_all if r["layer"] == "CON")
+
+# worst-case (last device) source-force path and a drain-force path
+cx5 = dev_cx[-1]
+sq_drop = abs(Y_BUS["SF"]) / W_FORCE
+sq_bus = ((cx5 + X_STUB["SF"]) - pad_x[2]) / W_FORCE
+sq_stub = (Y_SRC_C - Y_BUS["SF"]) / W_STUB
+r_src = (sq_drop + sq_stub) * RULES["RS_M2"] + sq_bus * RULES["RS_M1"]
+r_drn = ((PITCH / 2 - PAD / 2 + 3.0 + W_FORCE / 2) / W_FORCE) * RULES["RS_M2"]
+
+# ============================== DETAIL A (8:1) ===============================
+DET_S, DET_X0, DET_YTOP = 8.0, 0.0, -320.0
+cx1 = dev_cx[0]
+WIN = (cx1 - 45.0, cx1 + 45.0, -130.0, 45.0)
+
+
+def DX(x):
+    return DET_X0 + (x - WIN[0]) * DET_S
+
+
+def DY(y):
+    return DET_YTOP - (WIN[3] - y) * DET_S
+
+
+for r in list(rects_all):
+    x0, x1 = max(r["x0"], WIN[0]), min(r["x1"], WIN[1])
+    y0, y1 = max(r["y0"], WIN[2]), min(r["y1"], WIN[3])
+    if x1 <= x0 or y1 <= y0:
+        continue
+    _solid(r["layer"], "DET_" + r["label"], DX(x0), DY(y0), DX(x1), DY(y1),
+           r["z0"], r["z1"])
+
+edges_obj("DET_FRAME", rect_edges(DX(WIN[0]), DY(WIN[2]), DX(WIN[1]), DY(WIN[3])),
+          "DIM", color=(0.0, 0.5, 0.0), width=2.0)
+add_label("DETAIL A - M1 gap, 8:1 drawing scale (dimension values are TRUE um)",
+          DX(WIN[0]), DY(WIN[3]) + 14, DET_TEXT * 1.3, just="Left",
+          color=(0.0, 0.4, 0.0))
+
+# gap between pads
+hchain("DET_DIM_GAP", [DX(cx1 - 35), DX(cx1 + 35)], DY(41),
+       ["gap %s" % fmt(PITCH - PAD)], DET_TEXT, ext_from=DY(PAD / 2))
+# stub widths + spacings across the gap (row y = -47, crossing all four stubs)
+xs, labs, prev = [DX(cx1 - PAD / 2)], [], -PAD / 2
+for net in ("B", "G", "SF", "SS"):
+    left, right = X_STUB[net] - W_NET[net] / 2, X_STUB[net] + W_NET[net] / 2
+    xs += [DX(cx1 + left), DX(cx1 + right)]
+    labs += [fmt(left - prev), "%s %s" % (net, fmt(W_NET[net]))]
+    prev = right
+xs.append(DX(cx1 + PAD / 2))
+labs.append(fmt(PAD / 2 - prev))
+hchain("DET_DIM_STUBS", xs, DY(-47), labs, DET_TEXT, alt=True)
+# device width W
+hchain("DET_DIM_W", [DX(cx1 - W_ACT / 2), DX(cx1 + W_ACT / 2)], DY(31),
+       ["W = %s" % fmt(W_ACT)], DET_TEXT, ext_from=DY(Y_DRN[1]))
+# device structure, vertical chain on the right
+ys = [-PAD / 2, Y_SRC[0], Y_SRC[1], Y_GATE[1], Y_DRN[1], PAD / 2]
+vl = [fmt(ys[1] - ys[0]), "S diff %s" % fmt(ys[2] - ys[1]),
+      "L = %s" % fmt(ys[3] - ys[2]), "D diff %s" % fmt(ys[4] - ys[3]),
+      fmt(ys[5] - ys[4])]
+vchain("DET_DIM_DEV_Y", [DY(y) for y in ys], DX(cx1 + 40), vl, DET_TEXT,
+       ext_from=DX(cx1 + W_ACT / 2 + 2.0))
+# M1 bus widths + spacings, vertical chain on the left (below the pad row)
+yb_list, vlab, prev = [-PAD / 2], [], -PAD / 2
+for net in ("G", "B", "SF", "SS"):
+    top, bot = Y_BUS[net] + BUS_W[net] / 2, Y_BUS[net] - BUS_W[net] / 2
+    yb_list += [top, bot]
+    vlab += [fmt(prev - top), "%s %s" % (net, fmt(BUS_W[net]))]
+    prev = bot
+vchain("DET_DIM_BUS_Y", [DY(y) for y in yb_list], DX(cx1 - 40), vlab, DET_TEXT,
+       side=-1)
+# drain force / sense trace widths
+vchain("DET_DIM_DF", [DY(Y_DRN_C - W_FORCE / 2), DY(Y_DRN_C + W_FORCE / 2)],
+       DX(cx1 - 28), ["D_F %s" % fmt(W_FORCE)], DET_TEXT, side=-1)
+vchain("DET_DIM_DS", [DY(Y_DRN_C - W_SENSE / 2), DY(Y_DRN_C + W_SENSE / 2)],
+       DX(cx1 + 22), ["D_S %s" % fmt(W_SENSE)], DET_TEXT, side=1)
+
+# ======================= OVERALL DIMENSIONED TOP VIEW ========================
+edges_obj("FOOTPRINT_OUTLINE", rect_edges(bx0, by0, bx1, by1), "DIM",
+          color=(0.7, 0.0, 0.7), width=1.5)
+edges_obj("DETAIL_A_WINDOW", rect_edges(WIN[0], WIN[2], WIN[1], WIN[3]), "DIM",
+          color=(0.0, 0.5, 0.0), width=2.0)
+add_label("A", WIN[1] + 8.0, WIN[2] + 5.0, DIM_TEXT * 1.4, just="Left",
+          color=(0.0, 0.4, 0.0))
+
+p5, p6 = pad_x[4], pad_x[5]
+hchain("DIM_PAD_W", [p5 - PAD / 2, p5 + PAD / 2], 100.0, ["pad %s" % fmt(PAD)],
+       DIM_TEXT, ext_from=PAD / 2)
+hchain("DIM_PITCH", [p5, p6], 125.0, ["pitch %s" % fmt(PITCH)], DIM_TEXT,
+       ext_from=PAD / 2)
+hchain("DIM_GAP", [p5 + PAD / 2, p6 - PAD / 2], 150.0,
+       ["gap %s (M1 here)" % fmt(PITCH - PAD)], DIM_TEXT, ext_from=PAD / 2)
+vchain("DIM_PAD_H", [-PAD / 2, PAD / 2], -60.0, ["pad %s" % fmt(PAD)], DIM_TEXT,
+       ext_from=-PAD / 2, side=-1)
+dev_labels = ["M1 centre x=%s" % fmt(dev_cx[0])] + \
+             ["%s" % fmt(dev_cx[i + 1] - dev_cx[i]) for i in range(N_DUT - 1)]
+hchain("DIM_DEVICE_X", [0.0] + dev_cx, -150.0, dev_labels, DIM_TEXT,
+       ext_from=[-PAD / 2] + [Y_SRC[0]] * N_DUT)
+hchain("DIM_FOOTPRINT_W", [bx0, bx1], -195.0,
+       ["Total footprint W = %s um" % fmt(BW)], DIM_TEXT * 1.2,
+       ext_from=[-PAD / 2, -PAD / 2])
+vchain("DIM_FOOTPRINT_H", [by0, by1], bx1 + 45.0, ["H = %s um" % fmt(BH)],
+       DIM_TEXT * 1.2, ext_from=[bx1, bx1], side=1)
+
+# ================================ RULE TABLE =================================
+rule_rows = [["Rule / quantity", "Layer", "Drawn", "Requirement", "Margin",
+              "Status", "Basis"]]
+
+
+def _f(v, u):
+    return ("%.2f" % v) + (" " + u if u else "")
+
+
+def rule_min(name, layer, drawn, req, basis, unit="um"):
+    m = drawn - req
+    rule_rows.append([name, layer, _f(drawn, unit), ">= " + _f(req, unit),
+                      "%+.2f %s" % (m, unit), "OK" if m >= -1e-9 else "FAIL", basis])
+
+
+def rule_max(name, layer, drawn, req, basis, unit="um"):
+    m = req - drawn
+    rule_rows.append([name, layer, _f(drawn, unit), "<= " + _f(req, unit),
+                      "%+.2f %s" % (m, unit), "OK" if m >= -1e-9 else "FAIL", basis])
+
+
+def rule_exact(name, layer, drawn, req, basis, unit="um"):
+    ok = abs(drawn - req) < 1e-9
+    rule_rows.append([name, layer, _f(drawn, unit), "= " + _f(req, unit),
+                      "%+.2f %s" % (drawn - req, unit),
+                      "OK" if ok else "NON-COMPLIANT", basis])
+
+
+def info(name, layer, value, note):
+    rule_rows.append([name, layer, value, "-", "-", "INFO", note])
+
+
+A, G = "ASSUMED rule", "GIVEN"
+rule_exact("Pad size", "M2 pad", PAD, PAD_GIVEN, G)
+rule_min("Pad size vs probe minimum", "M2 pad", PAD, RULES["PAD_MIN_SIZE"], A)
+rule_exact("Pad pitch", "M2 pad", PITCH, PITCH_GIVEN, G)
+rule_min("Pad pitch vs probe minimum", "M2 pad", PITCH, RULES["PAD_MIN_PITCH"], A)
+rule_min("Pad-to-pad spacing (gap)", "M2 pad", PITCH - PAD, RULES["PAD_MIN_SPACE"], A)
+rule_min("M1 minimum trace width", "M1", min_dim(["M1"]), RULES["M1_W"], A)
+rule_min("M1 spacing (different nets)", "M1", m1_sp[0], RULES["M1_S"], A)
+rule_min("M2 minimum trace width", "M2", min_dim(["M2"]), RULES["M2_W"], A)
+rule_min("M2 spacing (different nets)", "M2", m2_sp[0], RULES["M2_S"], A)
+rule_min("Stub/trace to pad-edge clearance", "M2", pad_clear[0], RULES["M2_S"], A)
+rule_max("Widest non-pad metal (slotting)", "M1/M2", max_trace_w(["M1", "M2"]),
+         RULES["MAX_WIDE_METAL"], A)
+rule_min("M1 enclosure of via", "M1", (LAND_S - VIA_S) / 2, RULES["MET_ENCL_VIA"], A)
+rule_min("M2 enclosure of via", "M2", (LAND_S - VIA_S) / 2, RULES["MET_ENCL_VIA"], A)
+rule_exact("Via size (single big via)", "VIA", VIA_S, RULES["VIA_SIZE"],
+           A + "; needs via array")
+rule_exact("Contact size (single big contact)", "CON", con_min, RULES["CON_SIZE"],
+           A + "; needs contact array")
+rule_min("Gate length L", "POLY", min_dim(["POLY"]), RULES["POLY_W"], A)
+rule_min("Gate end-cap past active", "POLY", endcap, RULES["ENDCAP"], A)
+rule_min("Diffusion minimum width", "DIFF", min_dim(["DIFF"]), RULES["DIFF_W"], A)
+rule_min("Body-tap to active spacing", "DIFF", tap_sp, RULES["DIFF_S"], A)
+rule_min("Poly to contact spacing", "POLY/CON", poly_con, RULES["POLY_CON_S"], A)
+rule_min("Active to pad-edge (probe keep-out)", "DIFF/M2", act_pad,
+         RULES["ACTIVE_TO_PAD"], A)
+rule_min("D-force trace current capacity", "M2", W_FORCE * RULES["J_M2"],
+         I_TEST_MA, "CALC, assumed J", unit="mA")
+rule_min("S-force stub current capacity", "M2", W_STUB * RULES["J_M2"],
+         I_TEST_MA, "CALC, assumed J", unit="mA")
+rule_min("S-force bus current capacity", "M1", BUS_W["SF"] * RULES["J_M1"],
+         I_TEST_MA, "CALC, assumed J", unit="mA")
+info("Device keep-in margin to pad band (bottom / top)", "DIFF",
+     "%s / %s um" % (fmt(band_bot), fmt(band_top)), "CALC")
+info("Stub span inside gap (free: left / right)", "M2",
+     "%s / %s um" % (fmt(X_STUB["B"] - W_NET["B"] / 2 + PAD / 2),
+                     fmt(PAD / 2 - (X_STUB["SS"] + W_NET["SS"] / 2))), "CALC")
+info("S-force path R, worst DUT (M5), est.", "M1+M2",
+     "%.1f ohm = %.0f mV @ %.0f mA" % (r_src, r_src * I_TEST_MA, I_TEST_MA),
+     "removed by Kelvin sense")
+info("D-force path R, pad to drain, est.", "M2",
+     "%.2f ohm = %.1f mV @ %.0f mA" % (r_drn, r_drn * I_TEST_MA, I_TEST_MA),
+     "removed by Kelvin sense")
+info("Pad-row extent", "M2 pad", "%s um" % fmt(pad_x[-1] - pad_x[0] + PAD), "CALC")
+info("Total footprint (all layout geometry)", "all",
+     "%s x %s um = %.4f mm2" % (fmt(BW), fmt(BH), BW * BH * 1e-6), "CALC")
+info("Assumed test current", "-", "%.1f mA" % I_TEST_MA, "ASSUMED")
+
+n_ok = sum(1 for r in rule_rows[1:] if r[5] == "OK")
+n_nc = sum(1 for r in rule_rows[1:] if r[5] == "NON-COMPLIANT")
+n_fail = sum(1 for r in rule_rows[1:] if r[5] == "FAIL")
+
+concept_rows = [
+    ["Aspect", "This FreeCAD macro (CONCEPTUAL)", "Foundry-compliant physical layout"],
+    ["Purpose", "Topology + geometry visualization", "Mask data (GDSII/OASIS) to fabricate"],
+    ["Layers", "Generic SUB/DIFF/POLY/M1/VIA/M2 solids", "PDK layer/datatype set, wells, implants, STI, pad opening"],
+    ["Rules", "Placeholder values + simple spacing check", "Full foundry DRC deck, clean (incl. density, antenna)"],
+    ["Contacts/vias", "Single 4-6 um blocks", "Exact-size contact/via arrays on the mfg grid"],
+    ["Isolation", "None (one substrate block)", "Wells/deep-NWELL as needed, guard rings, latch-up taps"],
+    ["Pads", "70 um squares on M2", "Pad cell: top-metal stack, passivation window, ESD/probe rules"],
+    ["Grid", "Free-form um values", "Manufacturing grid snapping, angle rules"],
+    ["Devices", "Rectangles with W and L", "PDK device cells with models, matching, parasitics"],
+    ["Sign-off", "Visual review + this table", "DRC + LVS + PEX + EM/IR in the PDK flow"],
+]
+
+# ================================ TABLES / BANNER ============================
+bottom = draw_table("DESIGN-RULE CONSTRAINTS AND MARGINS (PLACEHOLDER RULES)",
+                    rule_rows, 800.0, DET_YTOP, TABLE_TEXT)
+draw_table("CONCEPTUAL FREECAD MODEL vs FOUNDRY-COMPLIANT LAYOUT",
+           concept_rows, 800.0, bottom - 90.0, TABLE_TEXT)
+
+add_label("CONCEPTUAL FreeCAD VISUALIZATION - NOT a foundry-compliant physical layout",
+          bx0, 235.0, 16.0, just="Left", color=(0.8, 0.0, 0.0))
+add_label("Rule values are PLACEHOLDERS: passing them does NOT mean DRC/LVS clean. "
+          "Final layout must be built and signed off in the foundry PDK flow.",
+          bx0, 212.0, 10.0, just="Left", color=(0.6, 0.0, 0.0))
+
+for i, lab in enumerate(labels):
+    add_label("P%d %s" % (i + 1, lab), pad_x[i], PAD / 2 + 8.0, LABEL_SIZE)
+for k, cx in enumerate(dev_cx, start=1):
+    add_label("M%d" % k, cx, PAD / 2 + 8.0 + 2.5 * LABEL_SIZE, LABEL_SIZE * 1.4)
+
+to_sheet("DRC_Margins", rule_rows)
+to_sheet("Concept_vs_Foundry", concept_rows)
+
+if EXPORT_CSV:
+    try:
+        path = os.path.join(os.path.expanduser("~"), "mosfet_test_module_rects.csv")
+        with open(path, "w") as fh:
+            fh.write("layer,label,net,x0_um,y0_um,x1_um,y1_um\n")
+            for r in rects_all:
+                fh.write("%s,%s,%s,%.3f,%.3f,%.3f,%.3f\n" % (
+                    r["layer"], r["label"], r["net"] or "", r["x0"], r["y0"],
+                    r["x1"], r["y1"]))
+        App.Console.PrintMessage("Rectangles exported to %s\n" % path)
+    except Exception as e:
+        App.Console.PrintWarning("CSV export failed: %s\n" % e)
+
+doc.recompute()
+if App.GuiUp:
+    import FreeCADGui as Gui
+    Gui.activeDocument().activeView().viewTop()
+    Gui.SendMsgToActiveView("ViewFit")
+
+# ================================== REPORT ===================================
+App.Console.PrintMessage(
+    "\n*** CONCEPTUAL FreeCAD VISUALIZATION - NOT a foundry-compliant layout ***\n")
+print_table("Design-rule constraints and margins (PLACEHOLDER rules)", rule_rows)
+App.Console.PrintMessage(
+    "\nPlaceholder-rule result: %d OK, %d NON-COMPLIANT (known concept "
+    "simplifications), %d FAIL; %d spacing/short violations.\n"
+    "Footprint %s x %s um (pad row %s um). A pass here is NOT foundry sign-off.\n"
+    % (n_ok, n_nc, n_fail, n_geom_viol, fmt(BW), fmt(BH),
+       fmt(pad_x[-1] - pad_x[0] + PAD)))

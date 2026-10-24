@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+# FreeCAD macro: 3 identical MOSFETs + measurement wiring for LDD extraction
+#
+# Measurement (middle device M2, between T3 and T5):
+#   T3 : S/D of M2  -> SMU1 (force small V_DS, measure I_D)      [red wire]
+#   T4 : gate of M2 -> SMU2 (sweep V_G, V_G - V_T = 0.3 ... 1.5 V) [blue wire]
+#   T5 : S/D of M2  -> GND                                         [black wire]
+#   T8 : body       -> GND                                         [black wire]
+#   T1, T2, T6, T7  -> floating (open stubs)                       [gray]
+#
+# Run: Macro > Macros... > Execute  (or paste in the Python console)
+
+import FreeCAD as App
+import Part
+
+V = App.Vector
+
+# ---------------- Device parameters (edit freely) ----------------
+Lg      = 40.0
+Lsp     = 20.0     # spacer length = LDD length
+SDw     = 70.0
+xj      = 35.0
+xj_ldd  = 12.0
+tox     = 2.0
+Hg      = 50.0
+tNiSi   = 6.0
+NiSi_in = 8.0
+W       = 120.0
+bodyT   = 80.0
+margin  = 20.0
+plugW   = 14.0
+plugH   = 70.0
+padW    = 50.0
+padT    = 10.0
+padStag = 6.0
+
+# ---------------- Wiring parameters ----------------
+wr      = 2.0      # wire radius
+stubH   = 30.0     # height of floating stubs
+instW   = 70.0     # instrument box size (X)
+instH   = 30.0     # instrument box height (Z)
+
+doc = App.newDocument("Three_MOSFET_LDD_Measurement")
+
+C = {
+    "body": (0.75, 0.85, 0.95), "sd": (0.65, 0.85, 0.60),
+    "ldd": (0.20, 0.55, 0.95), "chan": (0.10, 0.70, 0.35),
+    "ox": (0.95, 0.95, 0.95), "gate": (0.15, 0.35, 0.85),
+    "spacer": (0.85, 0.90, 0.20), "nisi": (0.80, 0.30, 0.30),
+    "plug": (0.30, 0.30, 0.30), "pad": (0.55, 0.20, 0.70),
+    "wD": (0.90, 0.10, 0.10), "wG": (0.10, 0.30, 0.95),
+    "wGND": (0.05, 0.05, 0.05), "wF": (0.60, 0.60, 0.60),
+    "inst": (1.00, 0.75, 0.20),
+}
+
+def add(name, shape, ckey, transp=0):
+    obj = doc.addObject("Part::Feature", name)
+    obj.Shape = shape
+    if App.GuiUp:
+        obj.ViewObject.ShapeColor = C[ckey]
+        obj.ViewObject.Transparency = transp
+    return obj
+
+def box(x, z, lx, lz, y=0.0, ly=None):
+    return Part.makeBox(lx, W if ly is None else ly, lz, V(x, y, z))
+
+def label(text, x, y, z):
+    """Text label in the 3D view (GUI only; silently skipped otherwise)."""
+    if not App.GuiUp:
+        return
+    try:
+        import Draft
+        Draft.make_text(text if isinstance(text, list) else [text], V(x, y, z))
+    except Exception as e:
+        App.Console.PrintWarning("Label skipped: %s\n" % e)
+
+# ---------------- Device geometry ----------------
+n_dev = 3
+pitch = SDw + 2 * Lsp + Lg
+total = n_dev * pitch + SDw
+bodyL = total + 2 * margin
+add("Body_T8", box(0, -bodyT, bodyL, bodyT), "body", 60)
+
+x0 = margin
+pads = {}                 # terminal -> (x_centre, z_top_of_pad)
+zTop_gate = tox + Hg
+
+def pad_and_plug(tnum, xc, z_base, stag):
+    yc = W / 2.0
+    add("Plug_T%d" % tnum,
+        Part.makeBox(plugW, W * 0.6, plugH, V(xc - plugW / 2, yc - W * 0.3, z_base)),
+        "plug")
+    zpad = z_base + plugH + stag
+    add("Terminal_%d" % tnum,
+        Part.makeBox(padW, W * 0.8, padT, V(xc - padW / 2, yc - W * 0.4, zpad)),
+        "pad")
+    pads[tnum] = (xc, zpad + padT)
+
+stag = 0.0
+for i in range(n_dev + 1):
+    xs = x0 + i * pitch
+    add("SD_%d" % (i + 1), box(xs, -xj, SDw, xj), "sd", 30)
+    add("NiSi_%d" % (i + 1), box(xs + NiSi_in, 0, SDw - 2 * NiSi_in, tNiSi), "nisi")
+    pad_and_plug(2 * i + 1, xs + SDw / 2.0, tNiSi, stag)
+    stag += padStag
+    if i == n_dev:
+        break
+
+    xl = xs + SDw
+    xc = xl + Lsp
+    xr = xc + Lg
+    add("LDD_L_%d" % (i + 1), box(xl, -xj_ldd, Lsp, xj_ldd), "ldd")
+    add("Channel_%d" % (i + 1), box(xc, -xj_ldd * 0.5, Lg, xj_ldd * 0.5), "chan")
+    add("LDD_R_%d" % (i + 1), box(xr, -xj_ldd, Lsp, xj_ldd), "ldd")
+    add("GateOx_%d" % (i + 1), box(xc, 0, Lg, tox), "ox")
+    add("Gate_%d" % (i + 1), box(xc, tox, Lg, Hg), "gate")
+    add("SpacerL_%d" % (i + 1), box(xl, 0, Lsp, zTop_gate), "spacer")
+    add("SpacerR_%d" % (i + 1), box(xr, 0, Lsp, zTop_gate), "spacer")
+    pad_and_plug(2 * i + 2, xc + Lg / 2.0, zTop_gate, stag)
+    stag += padStag
+
+# Body contact (T8) at the bottom
+xb = bodyL / 2.0
+add("Plug_T8",
+    Part.makeBox(plugW, W * 0.6, plugH, V(xb - plugW / 2, W * 0.2, -bodyT - plugH)),
+    "plug")
+zpad8 = -bodyT - plugH - padT
+add("Terminal_8",
+    Part.makeBox(padW, W * 0.8, padT, V(xb - padW / 2, W * 0.1, zpad8)), "pad")
+pads[8] = (xb, zpad8)     # wire leaves from the underside of the pad
+
+# ---------------- Wiring helpers ----------------
+def wire_seg(name, p1, p2, ckey):
+    d = p2 - p1
+    L = d.Length
+    if L < 1e-6:
+        return
+    add(name, Part.makeCylinder(wr, L, p1, d), ckey)
+
+def joint(name, p, ckey):
+    add(name, Part.makeSphere(wr * 1.15, p), ckey)
+
+def route(tag, tnum, yw, z_bus, x_end, z_end, ckey):
+    """pad -> vertical to z_bus -> horizontal in X to x_end -> vertical to z_end."""
+    xc, zt = pads[tnum]
+    p0 = V(xc, yw, zt)
+    p1 = V(xc, yw, z_bus)
+    p2 = V(x_end, yw, z_bus)
+    p3 = V(x_end, yw, z_end)
+    wire_seg("Wire_%s_a" % tag, p0, p1, ckey)
+    wire_seg("Wire_%s_b" % tag, p1, p2, ckey)
+    wire_seg("Wire_%s_c" % tag, p2, p3, ckey)
+    joint("Joint_%s_1" % tag, p1, ckey)
+    joint("Joint_%s_2" % tag, p2, ckey)
+    return p3
+
+def gnd_symbol(tag, p, direction=-1):
+    """Ground symbol (3 plates) hanging from point p, plates pointing down (-1) or up (+1)."""
+    x, y, z = p.x, p.y, p.z
+    wire_seg("Wire_%s_gnd" % tag, p, V(x, y, z + direction * 8), "wGND")
+    for k, s in enumerate((50.0, 34.0, 18.0)):
+        zc = z + direction * (8 + 3 * k)
+        add("GND_%s_plate%d" % (tag, k + 1),
+            Part.makeBox(s, s * 1.2, 3.0, V(x - s / 2, y - s * 0.6, zc - (3.0 if direction < 0 else 0))),
+            "wGND")
+    label("GND", x + 35, y, z + direction * 8)
+
+def instrument(tag, x_centre, z_bottom, text):
+    add("Instrument_%s" % tag,
+        Part.makeBox(instW, W * 0.9, instH, V(x_centre - instW / 2, W * 0.05, z_bottom)),
+        "inst")
+    label(text, x_centre - instW / 2, W * 0.05, z_bottom + instH + 6)
+
+# ---------------- Measurement wiring ----------------
+z_max = max(zt for (_, zt) in [pads[t] for t in range(1, 8)])
+z_inst = z_max + 120.0
+
+x3 = pads[3][0]
+x4 = pads[4][0]
+x5 = pads[5][0]
+
+# T3 -> SMU1 (force V_DS, measure I_D), red
+x_smu1 = x3 - 70.0
+p = route("T3", 3, W * 0.30, z_max + 40.0, x_smu1, z_inst, "wD")
+instrument("SMU1", x_smu1, z_inst, "SMU1: force Vds (10-50 mV), measure Id")
+
+# T4 -> SMU2 (gate sweep), blue
+x_smu2 = x4
+p = route("T4", 4, W * 0.50, z_max + 70.0, x_smu2, z_inst, "wG")
+instrument("SMU2", x_smu2, z_inst, "SMU2: sweep Vg (Vg-Vt = 0.3..1.5 V)")
+
+# T5 -> GND, black
+x_g5 = x5 + 70.0
+p = route("T5", 5, W * 0.70, z_max + 40.0, x_g5, z_max + 40.0, "wGND")
+gnd_symbol("T5", p, -1)
+
+# T8 -> GND (common ground with T5), black
+z_low = zpad8 - 40.0
+x_g8 = xb + 90.0
+p = route("T8", 8, W * 0.50, z_low, x_g8, z_low, "wGND")
+gnd_symbol("T8", p, -1)
+
+# Floating terminals T1, T2, T6, T7: short open stubs
+for t in (1, 2, 6, 7):
+    xc, zt = pads[t]
+    p0 = V(xc, W * 0.5, zt)
+    p1 = V(xc, W * 0.5, zt + stubH)
+    wire_seg("Stub_T%d" % t, p0, p1, "wF")
+    add("StubEnd_T%d" % t, Part.makeSphere(wr * 2.2, p1), "wF")
+    label("T%d float" % t, xc - 12, W * 0.5, zt + stubH + 8)
+
+# ---------------- Terminal labels + title ----------------
+for t in range(1, 8):
+    xc, zt = pads[t]
+    label("T%d" % t, xc - 5, -10.0, zt + 2)
+label("T8", pads[8][0] - 5, -10.0, zpad8 - 12)
+label(["LDD extraction on M2 (T3-T5):", "R_tot = 2*R_LDD + R_ch(Vg)",
+       "plot R_tot vs 1/(Vg-Vt); intercept = 2*R_LDD"],
+      0, -10.0, z_inst + instH + 40)
+
+doc.recompute()
+
+if App.GuiUp:
+    import FreeCADGui as Gui
+    Gui.ActiveDocument.ActiveView.viewFront()
+    Gui.SendMsgToActiveView("ViewFit")
+
+App.Console.PrintMessage(
+    "Done. Red=T3 (SMU1, force Vds/measure Id), Blue=T4 (SMU2, Vg sweep), "
+    "Black=T5 & T8 to GND, Gray=T1/T2/T6/T7 floating.\n")
